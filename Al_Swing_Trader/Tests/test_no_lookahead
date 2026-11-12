@@ -1,0 +1,475 @@
+
+"""
+Kiểm thử chống Lookahead Bias.
+
+Nguyên tắc:
+1. Feature tại thời điểm t không được phụ thuộc dữ liệu sau t.
+2. Thay đổi dữ liệu tương lai không được làm thay đổi feature quá khứ.
+3. Không được đưa nhãn tương lai vào feature.
+4. Không được dùng dữ liệu chưa có tại thời điểm dự đoán.
+
+Chạy:
+    python -m pytest tests/test_no_lookahead.py -v
+"""
+
+import numpy as np
+import pandas as pd
+import pytest
+
+try:
+    from features.feature_builder import build_features
+except ImportError:
+    from ..features.feature_builder import build_features
+
+
+# ============================================================
+# FIXTURES
+# ============================================================
+
+def make_ohlc(
+    n=200,
+    seed=42,
+):
+    """Tạo dữ liệu OHLC giả lập phục vụ kiểm thử."""
+    rng = np.random.default_rng(seed)
+
+    index = pd.date_range(
+        "2026-01-01",
+        periods=n,
+        freq="5min",
+    )
+
+    close = 100 + np.cumsum(
+        rng.normal(0, 0.25, n)
+    )
+
+    open_price = np.empty(n)
+    open_price[0] = close[0]
+    open_price[1:] = close[:-1]
+
+    high = (
+        np.maximum(open_price, close)
+        + rng.uniform(0.05, 0.25, n)
+    )
+
+    low = (
+        np.minimum(open_price, close)
+        - rng.uniform(0.05, 0.25, n)
+    )
+
+    return pd.DataFrame(
+        {
+            "Open": open_price,
+            "High": high,
+            "Low": low,
+            "Close": close,
+            "Volume": rng.integers(100, 1000, n),
+        },
+        index=index,
+    )
+
+
+@pytest.fixture
+def market_data():
+    return make_ohlc()
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def calculate_features(df):
+    """
+    Gọi feature builder theo giao diện thống nhất.
+
+    Feature builder phải chỉ trả về các biến đầu vào
+    của mô hình, không bao gồm target/label.
+    """
+    result = build_features(df.copy())
+
+    if isinstance(result, tuple):
+        # Nếu implementation trả về (features, metadata),
+        # lấy phần features.
+        result = result[0]
+
+    if not isinstance(result, pd.DataFrame):
+        raise TypeError(
+            "build_features phải trả về DataFrame "
+            "hoặc tuple có phần tử đầu là DataFrame."
+        )
+
+    return result
+
+
+def assert_same_features(
+    original_features,
+    modified_features,
+    cutoff,
+):
+    """So sánh feature trước và tại cutoff."""
+    left = original_features.loc[:cutoff]
+    right = modified_features.loc[:cutoff]
+
+    assert left.index.equals(right.index)
+
+    assert list(left.columns) == list(right.columns)
+
+    pd.testing.assert_frame_equal(
+        left,
+        right,
+        check_dtype=False,
+        check_exact=False,
+        rtol=1e-10,
+        atol=1e-10,
+    )
+
+
+def add_future_labels(df):
+    """
+    Tạo các cột nhãn giả lập để kiểm tra chúng
+    không bị đưa nhầm vào feature.
+    """
+    result = df.copy()
+
+    result["future_label"] = 0
+    result["future_top"] = 0
+    result["future_bottom"] = 0
+    result["target"] = 0
+
+    return result
+
+
+# ============================================================
+# BASIC FEATURE VALIDATION
+# ============================================================
+
+def test_feature_builder_returns_dataframe(market_data):
+    features = calculate_features(market_data)
+
+    assert isinstance(features, pd.DataFrame)
+
+
+def test_feature_index_is_preserved(market_data):
+    features = calculate_features(market_data)
+
+    assert features.index.equals(
+        market_data.index
+    )
+
+
+def test_features_do_not_contain_future_labels(
+    market_data,
+):
+    data = add_future_labels(market_data)
+
+    features = calculate_features(data)
+
+    forbidden_names = (
+        "future_",
+        "target",
+        "label",
+        "event_label",
+    )
+
+    leaked_columns = [
+        col
+        for col in features.columns
+        if any(
+            word in str(col).lower()
+            for word in forbidden_names
+        )
+    ]
+
+    assert not leaked_columns, (
+        "Phát hiện cột nhãn bị đưa vào feature: "
+        f"{leaked_columns}"
+    )
+
+
+def test_feature_values_are_numeric(market_data):
+    features = calculate_features(market_data)
+
+    non_numeric = [
+        col
+        for col in features.columns
+        if not pd.api.types.is_numeric_dtype(
+            features[col]
+        )
+    ]
+
+    assert not non_numeric, (
+        f"Có feature không phải kiểu số: {non_numeric}"
+    )
+
+
+def test_features_do_not_contain_infinite_values(
+    market_data,
+):
+    features = calculate_features(market_data)
+
+    numeric = features.select_dtypes(
+        include=[np.number]
+    )
+
+    assert not np.isinf(
+        numeric.to_numpy(dtype=float)
+    ).any()
+
+
+# ============================================================
+# CORE NO-LOOKAHEAD TESTS
+# ============================================================
+
+def test_future_changes_do_not_change_past_features(
+    market_data,
+):
+    """
+    Bài kiểm tra quan trọng nhất.
+
+    Tính feature với dữ liệu ban đầu.
+    Sau đó thay đổi toàn bộ dữ liệu phía sau cutoff.
+
+    Feature trước và tại cutoff phải không đổi.
+    """
+    cutoff_position = 100
+    cutoff = market_data.index[cutoff_position]
+
+    original_features = calculate_features(
+        market_data
+    )
+
+    modified = market_data.copy()
+
+    future_index = modified.index[
+        cutoff_position + 1:
+    ]
+
+    rng = np.random.default_rng(123)
+
+    # Thay đổi mạnh dữ liệu tương lai.
+    modified.loc[future_index, "Open"] += 500
+    modified.loc[future_index, "High"] += 700
+    modified.loc[future_index, "Low"] += 300
+    modified.loc[future_index, "Close"] += 600
+    modified.loc[future_index, "Volume"] *= 10
+
+    modified_features = calculate_features(
+        modified
+    )
+
+    assert_same_features(
+        original_features,
+        modified_features,
+        cutoff,
+    )
+
+
+def test_extreme_future_spike_does_not_change_past_features(
+    market_data,
+):
+    """
+    Một cú spike rất lớn ở tương lai không được
+    làm thay đổi ATR, volatility hoặc indicator quá khứ.
+    """
+    cutoff_position = 120
+    cutoff = market_data.index[cutoff_position]
+
+    original_features = calculate_features(
+        market_data
+    )
+
+    modified = market_data.copy()
+
+    future_position = cutoff_position + 10
+
+    modified.iloc[
+        future_position,
+        modified.columns.get_loc("High"),
+    ] = 100000
+
+    modified.iloc[
+        future_position,
+        modified.columns.get_loc("Low"),
+    ] = 1
+
+    modified.iloc[
+        future_position,
+        modified.columns.get_loc("Close"),
+    ] = 50000
+
+    modified_features = calculate_features(
+        modified
+    )
+
+    assert_same_features(
+        original_features,
+        modified_features,
+        cutoff,
+    )
+
+
+def test_future_rows_are_not_required_for_past_features(
+    market_data,
+):
+    """
+    Feature của phần dữ liệu đầu phải giống nhau
+    dù tính trên toàn bộ dữ liệu hay chỉ dữ liệu đến cutoff.
+
+    Lưu ý: test này giả định feature builder xử lý
+    warm-up theo cách nhất quán giữa hai lần tính.
+    """
+    cutoff_position = 100
+
+    full_features = calculate_features(
+        market_data
+    )
+
+    truncated_data = market_data.iloc[
+        :cutoff_position + 1
+    ].copy()
+
+    truncated_features = calculate_features(
+        truncated_data
+    )
+
+    cutoff = truncated_data.index[-1]
+
+    assert_same_features(
+        full_features,
+        truncated_features,
+        cutoff,
+    )
+
+
+def test_appending_future_data_does_not_rewrite_old_features(
+    market_data,
+):
+    """
+    Thêm dữ liệu mới vào cuối chuỗi không được
+    viết lại feature đã tính cho các nến cũ.
+    """
+    cutoff_position = 100
+
+    old_data = market_data.iloc[
+        :cutoff_position + 1
+    ].copy()
+
+    old_features = calculate_features(old_data)
+
+    extended_data = market_data.copy()
+
+    extended_features = calculate_features(
+        extended_data
+    )
+
+    cutoff = old_data.index[-1]
+
+    assert_same_features(
+        old_features,
+        extended_features,
+        cutoff,
+    )
+
+
+# ============================================================
+# INPUT VALIDATION
+# ============================================================
+
+def test_feature_builder_does_not_modify_input(
+    market_data,
+):
+    original = market_data.copy(deep=True)
+
+    calculate_features(market_data)
+
+    pd.testing.assert_frame_equal(
+        market_data,
+        original,
+    )
+
+
+def test_feature_builder_rejects_unsorted_data(
+    market_data,
+):
+    unsorted = market_data.iloc[::-1].copy()
+
+    with pytest.raises(
+        (ValueError, AssertionError)
+    ):
+        calculate_features(unsorted)
+
+
+def test_feature_builder_rejects_duplicate_timestamps(
+    market_data,
+):
+    duplicated = pd.concat(
+        [
+            market_data,
+            market_data.iloc[[10]],
+        ]
+    ).sort_index()
+
+    with pytest.raises(
+        (ValueError, AssertionError)
+    ):
+        calculate_features(duplicated)
+
+
+def test_feature_builder_rejects_missing_ohlc(
+    market_data,
+):
+    invalid = market_data.drop(
+        columns=["Close"]
+    )
+
+    with pytest.raises(
+        (ValueError, KeyError)
+    ):
+        calculate_features(invalid)
+
+
+# ============================================================
+# FUTURE DATA IS ALLOWED ONLY IN LABELS
+# ============================================================
+
+def test_future_label_columns_are_not_features(
+    market_data,
+):
+    """
+    Future labels được phép sử dụng dữ liệu tương lai
+    để tạo target.
+
+    Nhưng những cột đó không được xuất hiện trong X.
+    """
+    data = add_future_labels(market_data)
+
+    features = calculate_features(data)
+
+    forbidden = [
+        col
+        for col in features.columns
+        if str(col).lower().startswith("future_")
+        or str(col).lower() in (
+            "target",
+            "label",
+            "event_label",
+        )
+    ]
+
+    assert forbidden == []
+
+
+def test_feature_builder_is_deterministic(
+    market_data,
+):
+    """
+    Cùng dữ liệu đầu vào phải tạo cùng feature.
+    """
+    first = calculate_features(market_data)
+    second = calculate_features(market_data)
+
+    pd.testing.assert_frame_equal(
+        first,
+        second,
+        check_dtype=False,
+    )
